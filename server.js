@@ -1,112 +1,97 @@
-require('dotenv').config();
-const express = require('express');
-const axios = require('axios');
+const express = require("express");
+const axios = require("axios");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 app.use(express.json());
 
-/**
- * Normaliza teléfono Chile
- */
-function normalizePhone(raw) {
-    if (!raw) return null;
+// Variables de entorno
+const {
+  SF_CLIENT_ID,
+  SF_USERNAME,
+  SF_LOGIN_URL,
+  SF_PRIVATE_KEY
+} = process.env;
 
-    let p = raw.replace(/[^\d]/g, '');
-
-    if (p.length === 9) return '+56' + p;
-    if (p.startsWith('56')) return '+' + p;
-
-    return '+' + p;
-}
-
-/**
- * Obtener Access Token Salesforce
- */
+// Función para obtener access_token con JWT
 async function getAccessToken() {
-    const response = await axios.post(
-        'https://login.salesforce.com/services/oauth2/token',
-        new URLSearchParams({
-            grant_type: 'client_credentials',
-            client_id: process.env.SF_CLIENT_ID,
-            client_secret: process.env.SF_CLIENT_SECRET
-        }),
-        {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-        }
-    );
+  const payload = {
+    iss: SF_CLIENT_ID,
+    sub: SF_USERNAME,
+    aud: SF_LOGIN_URL,
+    exp: Math.floor(Date.now() / 1000) + 300
+  };
 
-    return response.data.access_token;
+  const token = jwt.sign(payload, SF_PRIVATE_KEY, { algorithm: "RS256" });
+
+  const response = await axios.post(
+    `${SF_LOGIN_URL}/services/oauth2/token`,
+    new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: token
+    }),
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+  );
+
+  return response.data;
 }
 
-/**
- * Buscar contacto en Salesforce
- */
-async function queryContact(token, phone) {
+// Endpoint de prueba JWT
+app.get("/auth-test", async (req, res) => {
+  try {
+    const auth = await getAccessToken();
+    res.json(auth);
+  } catch (error) {
+    res.status(500).json({ error: error.response?.data || error.message });
+  }
+});
+
+// Endpoint búsqueda por teléfono
+app.post("/search-by-phone", async (req, res) => {
+  try {
+    let { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: "Phone requerido" });
+
+    // Normalizar número
+    if (!phone.startsWith("+")) phone = "+" + phone;
+
+    const auth = await getAccessToken();
 
     const query = `
-        SELECT Id, FirstName, LastName, Email,
-               Account.Name, Account.Owner.Name
-        FROM Contact
-        WHERE Phone = '${phone}'
-        OR MobilePhone = '${phone}'
-        LIMIT 1
+      SELECT FirstName, Account.OwnerAlias
+      FROM Contact
+      WHERE MobilePhone = '${phone}'
+      LIMIT 1
     `;
 
     const response = await axios.get(
-        process.env.SF_INSTANCE_URL +
-        '/services/data/v58.0/query?q=' + encodeURIComponent(query),
-        {
-            headers: {
-                Authorization: 'Bearer ' + token
-            }
-        }
+      `${auth.instance_url}/services/data/v59.0/query`,
+      {
+        headers: { Authorization: `Bearer ${auth.access_token}` },
+        params: { q: query }
+      }
     );
 
-    return response.data.records[0] || null;
-}
+    if (response.data.records.length === 0) return res.json({ found: false });
 
-/**
- * Webhook Chattigo
- */
-app.post('/webhook/chattigo', async (req, res) => {
+    const contact = response.data.records[0];
 
-    try {
+    res.json({
+      found: true,
+      firstName: contact.FirstName,
+      ownerAlias: contact.Account?.OwnerAlias
+    });
 
-        const phone = normalizePhone(req.body.msisdn);
-
-        if (!phone) {
-            return res.json({ found: false });
-        }
-
-        const token = await getAccessToken();
-        const contact = await queryContact(token, phone);
-
-        if (!contact) {
-            return res.json({ found: false });
-        }
-
-        return res.json({
-            found: true,
-            firstName: contact.FirstName,
-            accountOwner: contact.Account?.Owner?.Name || "",
-            accountName: contact.Account?.Name || "",
-            email: contact.Email || ""
-        });
-
-    } catch (error) {
-        console.error(error.response?.data || error.message);
-        return res.status(500).json({ error: "Internal error" });
-    }
+  } catch (error) {
+    res.status(500).json({ error: error.response?.data || error.message });
+  }
 });
 
-/**
- * Endpoint de prueba
- */
-app.get('/', (req, res) => {
-    res.send("API funcionando correctamente");
+// Root
+app.get("/", (req, res) => {
+  res.send("API funcionando correctamente");
 });
 
+// Puerto dinámico para Render
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`API running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`API running on port ${PORT}`));
